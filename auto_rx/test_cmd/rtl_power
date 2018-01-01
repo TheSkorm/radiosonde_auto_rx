@@ -1,0 +1,2 @@
+#!/bin/bash
+cp test_files/rs41_test.power.csv log_power.csv

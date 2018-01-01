@@ -1,0 +1,3 @@
+#!/bin/bash
+cat test_files/rs41_test.detect.bin
+sleep 10000

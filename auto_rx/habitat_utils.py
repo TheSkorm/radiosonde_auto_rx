@@ -104,7 +104,7 @@ def initPayloadDoc(serial, description="Meteorology Radiosonde", frequency=40150
     global payload_config_cache 
     
     if serial in payload_config_cache:
-        return payload_config_cache["serial"]
+        return payload_config_cache[serial]
 
     payload_data = {
         "type": "payload_configuration",
@@ -195,7 +195,7 @@ def initPayloadDoc(serial, description="Meteorology Radiosonde", frequency=40150
     response = json.loads(urllib2.urlopen(req).read())
     if response['ok'] == True:
         logging.info("Habitat Listener: Created a payload document for %s" % serial)
-        payload_config_cache.append(response)
+        payload_config_cache[serial] = response
     else:
         logging.error("Habitat Listener: Failed to create a payload document for %s" % serial)
         logging.error(response)

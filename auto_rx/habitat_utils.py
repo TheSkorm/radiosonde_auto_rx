@@ -104,7 +104,7 @@ def initPayloadDoc(serial, description="Meteorology Radiosonde", frequency=40150
     global payload_config_cache 
     
     if serial in payload_config_cache:
-        return payload_config_cache["serial"]
+        return payload_config_cache[serial]
 
     payload_data = {
         "type": "payload_configuration",
@@ -192,10 +192,10 @@ def initPayloadDoc(serial, description="Meteorology Radiosonde", frequency=40150
             }
 
     req = urllib2.Request(url_habitat_db, data, headers)
-    response = json.loads(urllib2.urlopen(req).read())
+    response = json.loads(urllib2.urlopen(req, timeout=30).read())
     if response['ok'] == True:
-        logging.debug("Habitat Listener: Created a payload document for %s" % serial)
-        payload_config_cache = response
+        logging.info("Habitat Listener: Created a payload document for %s" % serial)
+        payload_config_cache[serial] = response
     else:
         logging.error("Habitat Listener: Failed to create a payload document for %s" % serial)
         logging.error(response)
@@ -219,13 +219,13 @@ def postListenerData(doc):
             }
 
     req = urllib2.Request(url_habitat_db, data, headers)
-    return urllib2.urlopen(req).read()
+    return urllib2.urlopen(req, timeout=30).read()
 
 def fetchUuids():
     global uuids, url_habitat_uuids
     while True:
         try:
-            resp = urllib2.urlopen(url_habitat_uuids % 10).read()
+            resp = urllib2.urlopen(url_habitat_uuids % 10, timeout=30).read()
             data = json.loads(resp)
         except urllib2.HTTPError, e:
             logging.error("Habitat Listener: Unable to fetch UUIDs, retrying in 10 seconds.")
@@ -236,11 +236,15 @@ def fetchUuids():
         break;
 
 
-def initListenerCallsign(callsign):
+def initListenerCallsign(callsign, version=''):
     doc = {
             'type': 'listener_information',
             'time_created' : ISOStringNow(),
-            'data': { 'callsign': callsign }
+            'data': {
+                'callsign': callsign,
+                'antenna': '',
+                'radio': 'radiosonde_auto_rx %s' % version,
+                }
             }
 
     while True:
@@ -253,12 +257,9 @@ def initListenerCallsign(callsign):
             time.sleep(10)
             continue
 
-def uploadListenerPosition(callsign, lat, lon):
-    # initialize call sign (one time only)
-    global callsign_init
-    if not callsign_init:
-        initListenerCallsign(callsign)
-        callsign_init = True
+def uploadListenerPosition(callsign, lat, lon, version=''):
+    """ Initializer Listener Callsign, and upload Listener Position """
+    initListenerCallsign(callsign, version=version)
 
     doc = {
         'type': 'listener_telemetry',

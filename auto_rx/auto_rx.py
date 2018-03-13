@@ -57,7 +57,6 @@ internet_push_queue = Queue.Queue()
 OZI_PUSH_RUNNING = True
 ozi_push_queue = Queue.Queue()
 
-
 # Flight Statistics data
 # stores copies of the telemetry dictionary returned by process_rs_line.
 flight_stats = {
@@ -69,9 +68,11 @@ flight_stats = {
 # Station config, we need to populate this with data from station.cfg
 config = {}
 
-def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_power='rtl_power', ppm = 0, gain = -1, bias = False):
+power_log_filename = "log_power_%i.csv" % os.getpid()
+
+def run_rtl_power(start, stop, step, filename=power_log_filename, dwell = 20, sdr_power='rtl_power', ppm = 0, gain = -1, bias = False, device=None):
     """ Run rtl_power, with a timeout"""
-    # Example: rtl_power -T -f 400400000:403500000:800 -i20 -1 -c 20% -p 0 -g 26.0 log_power.csv
+    # Example: rtl_power -T -f 400400000:403500000:800 -i20 -1 -c 20% -p 0 -g 26.0 log_power_1337.csv
 
     # Add a -T option if bias is enabled
     bias_option = "-T " if bias else ""
@@ -89,8 +90,10 @@ def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_p
         timeout_kill = ''
     else:
         timeout_kill = '-k 30 '
+    
+    device_option = ("-d " + device) if device else ""
 
-    rtl_power_cmd = "timeout %s%d %s %s-f %d:%d:%d -i %d -1 -c 20%% -p %d %s%s" % (timeout_kill, dwell+10, sdr_power, bias_option, start, stop, step, dwell, int(ppm), gain_param, filename)
+    rtl_power_cmd = "timeout %s%d %s %s %s -f %d:%d:%d -i %d -1 -c 20%% -p %d %s%s" % (timeout_kill, dwell+10, sdr_power, bias_option, device_option, start, stop, step, dwell, int(ppm), gain_param, filename)
     logging.info("Running frequency scan.")
     logging.debug("Running command: %s" % rtl_power_cmd)
     ret_code = os.system(rtl_power_cmd)
@@ -151,7 +154,7 @@ def quantize_freq(freq_list, quantize=5000):
     """ Quantise a list of frequencies to steps of <quantize> Hz """
     return np.round(freq_list/quantize)*quantize
 
-def detect_sonde(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, dwell_time=10):
+def detect_sonde(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, dwell_time=10, device=None):
     """ Receive some FM and attempt to detect the presence of a radiosonde. """
 
     # Example command (for command-line testing):
@@ -160,18 +163,21 @@ def detect_sonde(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, dwell_t
     # Add a -T option if bias is enabled
     bias_option = "-T " if bias else ""
 
+    # Add -d if a device is specified
+    device_option = ("-d " + device) if device else ""
+
     # Add a gain parameter if we have been provided one.
     if gain != -1:
         gain_param = '-g %.1f ' % gain
     else:
         gain_param = ''
 
-    rx_test_command = "timeout %ds %s %s-p %d %s-M fm -F9 -s 15k -f %d 2>/dev/null |" % (dwell_time, sdr_fm, bias_option, int(ppm), gain_param, frequency) 
+    rx_test_command = "timeout %ds %s %s-p %d %s %s-M fm -F9 -s 15k -f %d 2>/dev/null |" % (dwell_time, sdr_fm, bias_option, int(ppm), device_option, gain_param, frequency) 
     rx_test_command += "sox -t raw -r 15k -e s -b 16 -c 1 - -r 48000 -t wav - highpass 20 2>/dev/null |"
     rx_test_command += "./rs_detect -z -t 8 2>/dev/null"
 
     logging.info("Attempting sonde detection on %.3f MHz" % (frequency/1e6))
-    logging.debug("Running command: %s" % rx_test_command)
+    logging.info("Running command: %s" % rx_test_command)
 
     ret_code = os.system(rx_test_command)
 
@@ -220,7 +226,7 @@ def reset_rtlsdr():
         logging.error("Errors occured while attempting to reset USB device.")
 
 
-def sonde_search(config, attempts = 5):
+def sonde_search(config, attempts = 5, device=None):
     """ Perform a frequency scan across the defined range, and test each frequency for a radiosonde's presence. """
     search_attempts = attempts
 
@@ -231,23 +237,23 @@ def sonde_search(config, attempts = 5):
 
         if len(config['whitelist']) == 0 :
             # No whitelist frequencies provided - perform a scan.
-            run_rtl_power(config['min_freq']*1e6, config['max_freq']*1e6, config['search_step'], sdr_power=config['sdr_power_path'], ppm=config['sdr_ppm'], gain=config['sdr_gain'], bias=config['sdr_bias'])
+            run_rtl_power(config['min_freq']*1e6, config['max_freq']*1e6, config['search_step'], sdr_power=config['sdr_power_path'], ppm=config['sdr_ppm'], gain=config['sdr_gain'], bias=config['sdr_bias'], device=device)
 
             # Read in result
             try:
-                (freq, power, step) = read_rtl_power('log_power.csv')
+                (freq, power, step) = read_rtl_power(power_log_filename)
                 # Sanity check results.
                 if step == 0 or len(freq)==0 or len(power)==0:
                     raise Exception("Invalid file.")
 
                 if uber_debug:
                     # Copy log_power.csv to log directory, for later debugging.
-                    shutil.copy('log_power.csv', './log/log_power_%s.csv'%datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M%S'))
+                    shutil.copy(power_log_filename, './log/log_power_%s.csv'%datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M%S'))
 
 
             except Exception as e:
                 traceback.print_exc()
-                logging.error("Failed to read log_power.csv. Resetting RTLSDRs and attempting to run rtl_power again.")
+                logging.error("Failed to read %s. Resetting RTLSDRs and attempting to run rtl_power again." % power_log_filename)
                 # no log_power.csv usually means that rtl_power has locked up and had to be SIGKILL'd. 
                 # This occurs when it can't get samples from the RTLSDR, because it's locked up for some reason.
                 # Issuing a USB Reset to the rtlsdr can sometimes solve this. 
@@ -304,7 +310,8 @@ def sonde_search(config, attempts = 5):
                 ppm=config['sdr_ppm'], 
                 gain=config['sdr_gain'], 
                 bias=config['sdr_bias'], 
-                dwell_time=config['dwell_time'])
+                dwell_time=config['dwell_time'],
+                device=device)
             if detected != None:
                 sonde_freq = freq
                 sonde_type = detected
@@ -440,7 +447,7 @@ def calculate_flight_statistics():
 
     return stats_str
 
-def decode_rs92(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue=None, almanac=None, ephemeris=None, timeout=120, save_log=False):
+def decode_rs92(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue=None, almanac=None, ephemeris=None, timeout=120, save_log=False, device=None):
     """ Decode a RS92 sonde """
     global latest_sonde_data, internet_push_queue, ozi_push_queue
 
@@ -463,6 +470,8 @@ def decode_rs92(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue
     # Add a -T option if bias is enabled
     bias_option = "-T " if bias else ""
 
+    device_option = ("-d " + device) if device else ""
+
     # Add a gain parameter if we have been provided one.
     if gain != -1:
         gain_param = '-g %.1f ' % gain
@@ -471,7 +480,7 @@ def decode_rs92(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue
 
     # Example command:
     # rtl_fm -p 0 -g 26.0 -M fm -F9 -s 12k -f 400500000 | sox -t raw -r 12k -e s -b 16 -c 1 - -r 48000 -b 8 -t wav - highpass 20 lowpass 2500 2>/dev/null | ./rs92ecc
-    decode_cmd = "%s %s-p %d %s-M fm -F9 -s 12k -f %d 2>/dev/null |" % (sdr_fm,bias_option, int(ppm), gain_param, frequency)
+    decode_cmd = "%s %s-p %d %s %s-M fm -F9 -s 12k -f %d 2>/dev/null |" % (sdr_fm,bias_option, int(ppm), device_option, gain_param, frequency)
     decode_cmd += "sox -t raw -r 12k -e s -b 16 -c 1 - -r 48000 -b 8 -t wav - lowpass 2500 highpass 20 2>/dev/null |"
 
     # Note: I've got the check-CRC option hardcoded in here as always on. 
@@ -581,11 +590,13 @@ def decode_rs92(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue
     return
 
 
-def decode_rs41(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue=None, timeout=120, save_log=False):
+def decode_rs41(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue=None, timeout=120, save_log=False, device=None):
     """ Decode a RS41 sonde """
     global latest_sonde_data, internet_push_queue, ozi_push_queue
     # Add a -T option if bias is enabled
     bias_option = "-T " if bias else ""
+
+    device_option = ("-d " + device) if device else ""
 
     # Add a gain parameter if we have been provided one.
     if gain != -1:
@@ -595,7 +606,7 @@ def decode_rs41(frequency, sdr_fm='rtl_fm', ppm=0, gain=-1, bias=False, rx_queue
 
     # rtl_fm -p 0 -g -1 -M fm -F9 -s 15k -f 405500000 | sox -t raw -r 15k -e s -b 16 -c 1 - -r 48000 -b 8 -t wav - lowpass 2600 2>/dev/null | ./rs41ecc
     # Note: Have removed a 'highpass 20' filter from the sox line, will need to re-evaluate if adding that is useful in the future.
-    decode_cmd = "%s %s-p %d %s-M fm -F9 -s 15k -f %d 2>/dev/null |" % (sdr_fm, bias_option, int(ppm), gain_param, frequency)
+    decode_cmd = "%s %s %s-p %d %s-M fm -F9 -s 15k -f %d 2>/dev/null |" % (sdr_fm, device_option, bias_option, int(ppm), gain_param, frequency)
     decode_cmd += "sox -t raw -r 15k -e s -b 16 -c 1 - -r 48000 -b 8 -t wav - lowpass 2600 2>/dev/null |"
 
     # Note: I've got the check-CRC option hardcoded in here as always on. 
@@ -843,6 +854,7 @@ if __name__ == "__main__":
     parser.add_argument("-f", "--frequency", type=float, default=0.0, help="Sonde Frequency (MHz) (bypass scan step, and quit if no sonde found).")
     parser.add_argument("-t", "--timeout", type=int, default=180, help="Stop receiving after X minutes. Set to 0 to run continuously with no timeout.")
     parser.add_argument("-e", "--ephemeris", type=str, default="None", help="Use a manually obtained ephemeris file.")
+    parser.add_argument("-d", "--device", type=str, default=None, help="Select the desired rtl-sdr device to use for recieving.")
     args = parser.parse_args()
 
     # If we haven't been given an ephemeris file, set the ephemeris variable to None, so that we download one.
@@ -888,7 +900,7 @@ if __name__ == "__main__":
         while time.time() < timeout_time or args.timeout == 0:
             # Attempt to detect a sonde on a supplied frequency.
             if args.frequency != 0.0:
-                sonde_type = detect_sonde(int(float(args.frequency)*1e6), sdr_fm=config['sdr_fm_path'], ppm=config['sdr_ppm'], gain=config['sdr_gain'], bias=config['sdr_bias'])
+                sonde_type = detect_sonde(int(float(args.frequency)*1e6), sdr_fm=config['sdr_fm_path'], ppm=config['sdr_ppm'], gain=config['sdr_gain'], bias=config['sdr_bias'], device=args.device)
                 if sonde_type != None:
                     sonde_freq = int(float(args.frequency)*1e6)
                 else:
@@ -904,7 +916,7 @@ if __name__ == "__main__":
 
             # If nothing is detected, or we haven't been supplied a frequency, perform a scan.
             if sonde_type == None:
-                (sonde_freq, sonde_type) = sonde_search(config, config['search_attempts'])
+                (sonde_freq, sonde_type) = sonde_search(config, config['search_attempts'], device=args.device)
 
             # If we *still* haven't detected a sonde... just keep on trying, until we hit our timeout.
             if sonde_type == None:
@@ -935,7 +947,8 @@ if __name__ == "__main__":
                             rx_queue=internet_push_queue, 
                             timeout=config['rx_timeout'], 
                             save_log=config['per_sonde_log'], 
-                            ephemeris=ephemeris)
+                            ephemeris=ephemeris,
+                            device=args.device)
             elif sonde_type == "RS41":
                 decode_rs41(sonde_freq, 
                             sdr_fm=config['sdr_fm_path'],
@@ -944,7 +957,8 @@ if __name__ == "__main__":
                             bias=config['sdr_bias'], 
                             rx_queue=internet_push_queue, 
                             timeout=config['rx_timeout'], 
-                            save_log=config['per_sonde_log'])
+                            save_log=config['per_sonde_log'],
+                            device=args.device)
             else:
                 pass
 

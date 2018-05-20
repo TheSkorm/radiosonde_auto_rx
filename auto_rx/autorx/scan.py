@@ -45,7 +45,7 @@ def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_p
     # Example: rtl_power -T -f 400400000:403500000:800 -i20 -1 -c 20% -p 0 -g 26.0 log_power.csv
 
     # Add a -T option if bias is enabled
-    bias_option = "-T " if bias else ""
+    bias_option = "-T" if bias else ""
 
     # Add a gain parameter if we have been provided one.
     if gain != -1:
@@ -81,11 +81,21 @@ def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_p
 
     logging.info("Scanner - Running frequency scan.")
     logging.debug("Scanner - Running command: %s" % rtl_power_cmd)
-
     try:
-        FNULL = open(os.devnull, 'w')
-        subprocess.check_call(rtl_power_cmd, shell=True, stderr=FNULL)
-        FNULL.close()
+        #subprocess.check_call(rtl_power_cmd, shell=True, stderr=FNULL)
+        #rtl_power -f 400000000:403000000:800 -i 20 -1 -c 20% -p 0 -d 0 log_power_0.csv
+        #['rtl_power', '', 400000000.0, 403000000.0, 800.0, 20, 0, 0, '', '/dev/stdout']
+        process_args=[sdr_power,"-f", "%d:%d:%d" % (start, stop, step), "-i" ,str(dwell), "-1", "-c", "20%", "-p", str(ppm),"-d",str(device_idx),"/dev/stdout"]
+        
+        proc = subprocess.Popen(process_args,stdout=subprocess.PIPE)
+        stdout = ""
+        while True:
+            line = proc.stdout.readline()
+            if line != '':
+                stdout += line
+            else:
+                break
+        return stdout
     except subprocess.CalledProcessError:
         logging.critical("Scanner - rtl_power call failed!")
         return False
@@ -94,7 +104,7 @@ def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_p
 
 
 
-def read_rtl_power(filename):
+def read_rtl_power(data):
     """ Read in frequency samples from a single-shot log file produced by rtl_power 
 
     Args:
@@ -115,13 +125,11 @@ def read_rtl_power(filename):
     freq_step = 0
 
 
-    # Open file.
-    f = open(filename,'r')
 
     # rtl_power log files are csv's, with the first 6 fields in each line describing the time and frequency scan parameters
     # for the remaining fields, which contain the power samples. 
 
-    for line in f:
+    for line in data.split("\n"):
         # Split line into fields.
         fields = line.split(',')
 
@@ -423,7 +431,7 @@ class SondeScanner(object):
 
         if len(self.whitelist) == 0 :
             # No whitelist frequencies provided - perform a scan.
-            run_rtl_power(self.min_freq*1e6,
+            (freq, power, step) = read_rtl_power(run_rtl_power(self.min_freq*1e6,
                 self.max_freq*1e6,
                 self.search_step,
                 filename="log_power_%d.csv" % self.device_idx,
@@ -432,7 +440,7 @@ class SondeScanner(object):
                 device_idx=self.device_idx,
                 ppm=self.ppm,
                 gain=self.gain,
-                bias=self.bias)
+                bias=self.bias))
 
             # Exit opportunity.
             if self.sonde_scanner_running == False:
@@ -440,7 +448,6 @@ class SondeScanner(object):
 
             # Read in result.
             # This step will throw an IOError if the file does not exist.
-            (freq, power, step) = read_rtl_power("log_power_%d.csv" % self.device_idx)
             # Sanity check results.
             if step == 0 or len(freq)==0 or len(power)==0:
                 # Otherwise, if a file has been written but contains no data, it can indicate

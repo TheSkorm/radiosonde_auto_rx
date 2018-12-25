@@ -16,3 +16,4 @@ scan/reset_usb
 scan/rs_detect
 *.pyc
 *.o
+**/node_modules/*

@@ -63,6 +63,11 @@ def flask_index():
     """ Render main index page """
     return flask.render_template('index.html')
 
+@app.route("/sondehub")
+def flask_sondehub():
+    """ Render sondehub page """
+    return flask.render_template('sondehub.html')
+
 
 @app.route("/get_version")
 def flask_get_version():

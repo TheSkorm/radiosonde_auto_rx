@@ -1,0 +1,6 @@
+To update sondehub-bundle.js
+```
+npm install
+npm install -g browserify
+browserify sondehub.js -o sondehub-bundle.js
+```

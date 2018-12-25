@@ -214,7 +214,8 @@ payload_id_valid = 5
 # Paths to the rtl_fm and rtl_power utilities. If these are on your system path, then you don't need to change these.
 sdr_fm_path = rtl_fm
 sdr_power_path = rtl_power
-
+# setting this to True will disable some safety checks and allow you to test the webserver without an SDR - you'll need to set sdr_quantity to 0
+web_only = False
 
 # Rotator Settings
 #   auto_rx can communicate with an instance of rotctld, on either the local machine or elsewhere on the network.

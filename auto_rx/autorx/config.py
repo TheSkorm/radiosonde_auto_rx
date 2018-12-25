@@ -82,6 +82,7 @@ def read_auto_rx_config(filename):
 		'web_port'		: 5000,
 		'web_archive_age': 120,
 		# Advanced Parameters
+		'web_only': False,
 		'search_step'	: 800,
 		'snr_threshold'		: 10,
 		'min_distance'	: 1000,
@@ -188,6 +189,10 @@ def read_auto_rx_config(filename):
 		auto_rx_config['scan_delay'] = config.getint('advanced', 'scan_delay')
 		auto_rx_config['payload_id_valid'] = config.getint('advanced', 'payload_id_valid')
 		auto_rx_config['synchronous_upload'] = config.getboolean('advanced', 'synchronous_upload')
+		try: # optional
+			auto_rx_config['web_only'] = config.getboolean('advanced', 'web_only')
+		except:
+			pass
 
 		# Rotator Settings
 		auto_rx_config['rotator_enabled'] = config.getboolean('rotator','rotator_enabled')
@@ -268,8 +273,8 @@ def read_auto_rx_config(filename):
 			logging.critical("Chase car outputs (OziPlotter/Payload Summary) enabled in a multi-SDR configuration.")
 			return None
 
-
-		if len(auto_rx_config['sdr_settings'].keys()) == 0:
+		# skip this check if we are running in web only mode
+		if len(auto_rx_config['sdr_settings'].keys()) == 0 and (auto_rx_config['web_only'] == 0):
 			# We have no SDRs to use!!
 			logging.error("Config - No working SDRs! Cannot run...")
 			return None

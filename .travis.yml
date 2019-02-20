@@ -8,8 +8,10 @@ virtualenv:
 before_install:
   - sudo apt-get update
   - sudo apt-get install -y python-numpy python-setuptools python-crcmod python-requests python-dateutil python-pip sox git build-essential cmake usbutils libusb-1.0-0-dev rng-tools
-install:
-  - pip install flask flask-socketio
-  - cd TheSkorm/radiosonde_auto_rx/auto_rx
+  - sudo pip install flask flask-socketio
+script:
+  - ls
+  - pwd
+  - cd auto_rx
   - ./build.sh
 

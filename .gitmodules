@@ -1,3 +1,6 @@
 [submodule "auto_rx/tests"]
 	path = auto_rx/tests
 	url = https://github.com/projecthorus/radiosonde_auto_rx_mocks.git
+[submodule "tests"]
+	path = tests
+	url = git@github.com:projecthorus/radiosonde_auto_rx_mocks.git

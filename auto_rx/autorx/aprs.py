@@ -41,15 +41,47 @@ def telemetry_to_aprs_position(sonde_data, object_name="<id>", aprs_comment="BOM
             _object_name = sonde_data["id"].strip()
         elif sonde_data['type'] == 'DFM':
             # The DFM sonde IDs are too long to use directly.
-            # Grab the last six digits of the sonde ID (which is the serial number)
-            _id_suffix = sonde_data['id'][-6:]
+
+            # Split out just the serial number part of the ID, and cast it to an int
+            _dfm_id = int(sonde_data['id'].split('-')[-1])
+
+            # Convert to upper-case hex, and take the last 5 nibbles.
+            _id_suffix = hex(_dfm_id).upper()[-5:]
+
+            # Append the hex ID to a shortened sonde-type.
             if "DFM09" in sonde_data['id']:
                 _object_name = "DF9" + _id_suffix
-            else:
+                sonde_data['type'] = 'DFM09'
+            elif "DFM06" in sonde_data['id']:
                 _object_name = "DF6" + _id_suffix
+                sonde_data['type'] = 'DFM06'
+            elif "DFM15" in sonde_data['id']:
+                _object_name = "DF5" + _id_suffix
+                sonde_data['type'] = 'DFM15'
+            elif "DFM17" in sonde_data['id']:
+                _object_name = "DF7" + _id_suffix
+                sonde_data['type'] = 'DFM17'
+            elif 'DFMx' in sonde_data['id']:
+                # Catch-all for the 'unknown' DFM types.
+                _object_name = "DF" + sonde_data['id'][4] + _id_suffix
+                sonde_data['type'] = sonde_data['id'].split('-')[0]
+            else:
+                return (None, None)
+
         elif 'M10' in sonde_data['type']:
-            # Use the generated id same as dxlARPS
+            # Use the generated id same as dxlAPRS
             _object_name = sonde_data['dxlid']
+
+        elif 'iMet' in sonde_data['type']:
+            # Use the last 5 characters of the unique ID we have generated.
+            _object_name = "IMET" + sonde_data['id'][-5:]
+
+        elif ('MK2LMS' in sonde_data['type']) or ('LMS6' in sonde_data['type']):
+            # Use the last 5 hex digits of the sonde ID.
+            _id_suffix = int(sonde_data['id'].split('-')[1])
+            _id_hex = hex(_id_suffix).upper()
+            _object_name = "LMS6" + _id_hex[-5:]
+
         # New Sonde types will be added in here.
         else:
             # Unknown sonde type, don't know how to handle this yet.
@@ -72,6 +104,8 @@ def telemetry_to_aprs_position(sonde_data, object_name="<id>", aprs_comment="BOM
     _aprs_comment = _aprs_comment.replace("<vel_v>", "%.1fm/s" % sonde_data['vel_v'])
     _aprs_comment = _aprs_comment.replace("<type>", sonde_data['type'])
 
+    # TODO: RS41 Burst Timer
+
     # Convert float latitude to APRS format (DDMM.MM)
     lat = float(sonde_data["lat"])
     lat_degree = abs(int(lat))
@@ -93,9 +127,14 @@ def telemetry_to_aprs_position(sonde_data, object_name="<id>", aprs_comment="BOM
     lon_str = "%03d%s" % (lon_degree,lon_min_str) + lon_dir
 
     # Generate the added digits of precision, as per http://www.aprs.org/datum.txt
-    # Note: This is a bit hacky.
-    _lat_prec = chr(int(("%02.4f" % lat_minute)[-2:]) + 33)
-    _lon_prec = chr(int(("%02.4f" % lon_minute)[-2:]) + 33)
+    # Base-91 can only encode decimal integers between 0 and 93 (otherwise we end up with non-printable characters)
+    # So, we have to scale the range 00-99 down to 0-90, being careful to avoid errors due to floating point math.
+    _lat_prec = int(round(float(("%02.4f" % lat_minute)[-2:])/1.10))
+    _lon_prec = int(round(float(("%02.4f" % lon_minute)[-2:])/1.10))
+
+    # Now we can add 33 to the 0-90 value to produce the Base-91 character.
+    _lat_prec = chr(_lat_prec + 33)
+    _lon_prec = chr(_lon_prec + 33)
 
     # Produce Datum + Added precision string
     # We currently assume all position data is using the WGS84 datum,
@@ -129,7 +168,7 @@ def telemetry_to_aprs_position(sonde_data, object_name="<id>", aprs_comment="BOM
 
 
 
-def generate_station_object(callsign, lat, lon, comment="radiosonde_auto_rx SondeGate v<version>", icon='/r'):
+def generate_station_object(callsign, lat, lon, comment="radiosonde_auto_rx SondeGate v<version>", icon='/r', position_report=False):
     ''' Generate a station object '''
 
     # Pad or limit the station callsign to 9 characters, if it is to long or short.
@@ -168,7 +207,13 @@ def generate_station_object(callsign, lat, lon, comment="radiosonde_auto_rx Sond
     _aprs_comment = _aprs_comment.replace('<version>', auto_rx_version)
 
     # Generate output string
-    out_str = ";%s*%sh%s%s%s%s%s" % (callsign, _aprs_timestamp, lat_str, icon[0], lon_str, icon[1], _aprs_comment)
+    if position_report:
+        # Produce a position report with no timestamp, as per page 32 of http://www.aprs.org/doc/APRS101.PDF
+        out_str = "!%s%s%s%s%s" % (lat_str, icon[0], lon_str, icon[1], _aprs_comment)
+
+    else:
+        # Produce an object string
+        out_str = ";%s*%sh%s%s%s%s%s" % (callsign, _aprs_timestamp, lat_str, icon[0], lon_str, icon[1], _aprs_comment)
 
     return out_str
 
@@ -208,7 +253,7 @@ class APRSUploader(object):
                 aprsis_port = 14580,
                 station_beacon = False,
                 station_beacon_rate = 30,
-                station_beacon_position = [0.0,0.0],
+                station_beacon_position = (0.0,0.0,0.0),
                 station_beacon_comment = "radiosonde_auto_rx SondeGate v<version>",
                 station_beacon_icon = "/r",
                 synchronous_upload_time = 30,
@@ -237,7 +282,7 @@ class APRSUploader(object):
 
             station_beacon (bool): Enable beaconing of station position.
             station_beacon_rate (int): Time delay between beacon uploads (minutes)
-            station_beacon_position (list): [lat, lon], in decimal degrees, of the station position.
+            station_beacon_position (tuple): (lat, lon, alt), in decimal degrees, of the station position.
             station_beacon_comment (str): Comment field for the station beacon. <version> will be replaced with the current auto_rx version.
             station_beacon_icon (str): The APRS icon to be used, as the two characters (symbol table, symbol index), as per http://www.aprs.org/symbols.html
 
@@ -363,18 +408,29 @@ class APRSUploader(object):
     def beacon_station_position(self):
         ''' Send a station position beacon into APRS-IS '''
         if self.station_beacon['enabled']:
+            if (self.station_beacon['position'][0] == 0.0) and (self.station_beacon['position'][1] == 0.0):
+                self.log_error("Station position is 0,0, not uploading position beacon.")
+                self.last_user_position_upload = time.time()
+                return
+
+
             # Generate the station position packet
-            # Note - this is generated as an APRS object.
+            # Note - this is now generated as an APRS position report, for radiosondy.info compatability.
             _packet = generate_station_object(self.aprs_callsign,
                 self.station_beacon['position'][0], 
                 self.station_beacon['position'][1],
                 self.station_beacon['comment'], 
-                self.station_beacon['icon'])
+                self.station_beacon['icon'],
+                position_report=True)
 
-            # Send the packet
-            self.aprsis_upload(self.aprs_callsign, _packet, igate=False)
+            # Send the packet as an iGated packet.
+            self.aprsis_upload(self.aprs_callsign, _packet, igate=True)
             self.last_user_position_upload = time.time()
 
+
+    def update_station_position(self, lat, lon, alt):
+        """ Update the internal station position record. Used when determining the station position by GPSD """
+        self.station_beacon['position'] = (lat, lon, alt)
 
 
 
@@ -501,6 +557,10 @@ class APRSUploader(object):
 
         """
 
+        # Discard any telemetry which is indicated to be encrypted.
+        if 'encrypted' in telemetry:
+            return
+
         # Check the telemetry dictionary contains the required fields.
         for _field in self.REQUIRED_FIELDS:
             if _field not in telemetry:
@@ -564,6 +624,26 @@ class APRSUploader(object):
         """
         logging.warning("APRS-IS - %s" % line)
 
+
+
+if __name__ == "__main__":
+    # Some unit tests for the APRS packet generation code.
+    # ['frame', 'id', 'datetime', 'lat', 'lon', 'alt', 'temp', 'type', 'freq', 'freq_float', 'datetime_dt']
+    test_telem = [
+        {'id':'DFM06-123456', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'DFM', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        {'id':'DFM09-123456', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'DFM', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        {'id':'DFM15-123456', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'DFM', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        {'id':'DFM17-12345678', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'DFM', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        {'id':'N1234567', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'RS41', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        {'id':'M1234567', 'frame':10, 'lat':-10.0, 'lon':10.0, 'alt':10000, 'temp':1.0, 'type':'RS92', 'freq':'401.520 MHz', 'freq_float':401.52, 'heading':0.0, 'vel_h':5.1, 'vel_v':-5.0, 'datetime_dt':datetime.datetime.utcnow()},
+        ]
+
+
+    comment_field = "Clb=<vel_v> t=<temp> <freq> Type=<type> Radiosonde http://bit.ly/2Bj4Sfk"
+
+    for _telem in test_telem:
+        out_str = telemetry_to_aprs_position(_telem, object_name="<id>", aprs_comment=comment_field, position_report=False)
+        print(out_str)
 
 
 

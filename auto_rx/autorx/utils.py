@@ -12,11 +12,15 @@ import logging
 import os
 import platform
 import re
+import requests
 import subprocess
 import threading
 import time
 import numpy as np
+from dateutil.parser import parse
+from datetime import datetime, timedelta
 from math import radians, degrees, sin, cos, atan2, sqrt, pi
+from . import __version__ as auto_rx_version
 try:
     # Python 2
     from Queue import Queue
@@ -26,7 +30,7 @@ except ImportError:
 
 
 # List of binaries we check for on startup
-REQUIRED_RS_UTILS = ['rs_detect', 'rs41ecc', 'rs92ecc', 'dfm09ecc', 'm10']
+REQUIRED_RS_UTILS = ['dft_detect', 'dfm09mod', 'm10', 'imet1rs_dft', 'rs41mod', 'rs92mod', 'fsk_demod', 'mk2a_lms1680', 'lms6mod']
 
 def check_rs_utils():
     """ Check the required RS decoder binaries exist
@@ -34,10 +38,36 @@ def check_rs_utils():
     """
     for _file in REQUIRED_RS_UTILS:
         if not os.path.isfile(_file):
-            logging.critical("RS binary %s does not exist - did you run build.sh?" % _file)
+            logging.critical("Binary %s does not exist - did you run build.sh?" % _file)
             return False
 
     return True
+
+
+AUTORX_VERSION_URL = "https://raw.githubusercontent.com/projecthorus/radiosonde_auto_rx/master/auto_rx/autorx/__init__.py"
+def check_autorx_version():
+    """ Grab the latest __init__ file from Github and compare the version with our current version. """
+    try:
+        _r = requests.get(AUTORX_VERSION_URL,timeout=5)
+    except Exception as e:
+        logging.error("Version - Error determining latest master version - %s" % str(e))
+        return
+
+    _version = "Unknown"
+
+    try:
+        for _line in _r.text.split('\n'):
+            if _line.startswith("__version__"):
+                _version = _line.split('=')[1]
+                _version = _version.replace("\"", "").strip()
+                break
+    except Exception as e:
+        logging.error("Version - Error determining latest master version.")
+
+    logging.info("Version - Local Version: %s  Current Master Version: %s" % (auto_rx_version, _version))
+
+
+
 
 
 class AsynchronousFileReader(threading.Thread):
@@ -341,6 +371,8 @@ def lsusb():
         FNULL = open(os.devnull, 'w')
         lsusb_raw_output = subprocess.check_output(['lsusb', '-v'], stderr=FNULL)
         FNULL.close()
+        # Convert from bytes.
+        lsusb_raw_output = lsusb_raw_output.decode('utf8')
     except Exception as e:
         logging.error("lsusb parse error - %s" % str(e))
         return
@@ -531,7 +563,7 @@ def reset_all_rtlsdrs():
 
 
 
-def rtlsdr_test(device_idx='0', rtl_sdr_path="rtl_sdr"):
+def rtlsdr_test(device_idx='0', rtl_sdr_path="rtl_sdr", retries = 2):
     """ Test that a RTLSDR with supplied device ID is accessible.
 
     This function attempts to read a small set of samples from a rtlsdr using rtl-sdr.
@@ -564,7 +596,7 @@ def rtlsdr_test(device_idx='0', rtl_sdr_path="rtl_sdr"):
     # So now we know the rtlsdr we are attempting to test does exist.
     # We make an attempt to read samples from it:
 
-    _rtlsdr_retries = 2
+    _rtlsdr_retries = retries
 
     while _rtlsdr_retries > 0:
         try:
@@ -708,9 +740,7 @@ def peak_decimation(freq, power, factor):
     return (_freq_out, _power_out)
 
 
-
 if __name__ == "__main__":
     import sys
     logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s', level=logging.DEBUG)
-    print(lsusb())
-    print(rtlsdr_test(sys.argv[1]))
+    check_autorx_version()

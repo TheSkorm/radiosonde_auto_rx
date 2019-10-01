@@ -36,11 +36,15 @@ class OziUploader(object):
     # We require the following fields to be present in the incoming telemetry dictionary data
     REQUIRED_FIELDS = ['frame', 'id', 'datetime', 'lat', 'lon', 'alt', 'temp', 'type', 'freq', 'freq_float', 'datetime_dt']
 
+    # Extra fields we can pass on to other programs.
+    EXTRA_FIELDS = ['bt', 'humidity', 'sats', 'batt']
+
 
     def __init__(self,
         ozimux_port = None,
         payload_summary_port = None,
-        update_rate = 5
+        update_rate = 5,
+        station = "auto_rx"
         ):
         """ Initialise an OziUploader Object.
 
@@ -53,6 +57,7 @@ class OziUploader(object):
         self.ozimux_port = ozimux_port
         self.payload_summary_port = payload_summary_port
         self.update_rate = update_rate
+        self.station = station
 
         # Input Queue. 
         self.input_queue = Queue()
@@ -128,6 +133,7 @@ class OziUploader(object):
 
             packet = {
                 'type' : 'PAYLOAD_SUMMARY',
+                'station': self.station,
                 'callsign' : telemetry['id'],
                 'latitude' : telemetry['lat'],
                 'longitude' : telemetry['lon'],
@@ -139,8 +145,16 @@ class OziUploader(object):
                 # Additional fields specifically for radiosondes
                 'model': telemetry['type'],
                 'freq': telemetry['freq'],
-                'temp': telemetry['temp']
+                'temp': telemetry['temp'],
+                'frame': telemetry['frame']
             }
+
+            # Add in any extra fields we may care about.
+            for _field in self.EXTRA_FIELDS:
+                if _field in telemetry:
+                    packet[_field] = telemetry[_field]
+
+
 
             # Set up our UDP socket
             _s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)

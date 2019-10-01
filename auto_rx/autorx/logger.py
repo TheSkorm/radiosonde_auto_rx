@@ -36,7 +36,7 @@ class TelemetryLogger(object):
     FILE_ACTIVITY_TIMEOUT = 30
 
     # We require the following fields to be present in the input telemetry dict.
-    REQUIRED_FIELDS = ['frame', 'id', 'datetime', 'lat', 'lon', 'alt', 'temp', 'type', 'freq', 'datetime_dt']
+    REQUIRED_FIELDS = ['frame', 'id', 'datetime', 'lat', 'lon', 'alt', 'temp', 'humidity', 'type', 'freq', 'datetime_dt']
 
     def __init__(self,
         log_directory = "./log"):
@@ -116,7 +116,7 @@ class TelemetryLogger(object):
         Args:
             telemetry (dict): Telemetry dictionary to process.
         """
-        _log_line = "%s,%s,%d,%.5f,%.5f,%.1f,%.1f,%s,%.3f\n" % (
+        _log_line = "%s,%s,%d,%.5f,%.5f,%.1f,%.1f,%.1f,%s,%.3f" % (
             telemetry['datetime'],
             telemetry['id'],
             telemetry['frame'],
@@ -124,10 +124,29 @@ class TelemetryLogger(object):
             telemetry['lon'],
             telemetry['alt'],
             telemetry['temp'],
+            telemetry['humidity'],
             telemetry['type'],
             telemetry['freq_float'])
 
-        # TODO: Add Aux data, if it exists.
+        # Other fields that may not always be present.
+        if 'sats' in telemetry:
+            _log_line += ",SATS %d" % telemetry['sats']
+
+        if 'batt' in telemetry:
+            _log_line += ",BATT %.1f" % telemetry['batt']
+
+        # Check for Burst/Kill timer data, and add in.
+        if 'bt' in telemetry:
+            if (telemetry['bt'] != -1) and (telemetry['bt'] != 65535):
+                _log_line += ",BT %s" % time.strftime("%H:%M:%S", time.gmtime(telemetry['bt']))
+
+        # Add Aux data, if it exists.
+        if 'aux' in telemetry:
+            _log_line += ",AUX %s" % telemetry['aux'].strip()
+
+
+        # Terminate the log line.
+        _log_line += "\n"
 
         return _log_line
 
@@ -141,9 +160,10 @@ class TelemetryLogger(object):
         _id = telemetry['id']
         _type = telemetry['type']
 
+
         # If there is no log open for the current ID check to see if there is an existing (closed) log file, and open it.
         if _id not in self.open_logs:
-            _search_string = os.path.join(self.log_directory, "*%s_%s*_sonde.log" % (_id, _type))
+            _search_string = os.path.join(self.log_directory, "*%s_*_sonde.log" % (_id))
             _existing_files = glob.glob(_search_string)
             if len(_existing_files) != 0:
                 # Open the existing log file.
@@ -181,7 +201,7 @@ class TelemetryLogger(object):
 
         _now = time.time()
 
-        for _id in self.open_logs.keys():
+        for _id in self.open_logs.copy().keys():
             try:
                 if _now > (self.open_logs[_id]['last_time'] + self.FILE_ACTIVITY_TIMEOUT):
                     # Flush and close the log file, and pop this element from the dictionary.

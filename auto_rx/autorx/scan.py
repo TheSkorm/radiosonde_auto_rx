@@ -13,16 +13,23 @@ import platform
 import subprocess
 import time
 import traceback
-from threading import Thread
+from threading import Thread, Lock
 from types import FunctionType, MethodType
 from .utils import detect_peaks, rtlsdr_test, reset_rtlsdr_by_serial, reset_all_rtlsdrs, peak_decimation
-from .web import flask_emit_event
 try:
     # Python 2
     from StringIO import StringIO
 except ImportError:
     # Python 3
     from io import StringIO
+
+try:
+    from .web import flask_emit_event
+except ImportError:
+    # Running in a test scenario. Make a dummy flask_emit_event function.
+    def flask_emit_event(event_name, data):
+        print("Running in a test scenario, no data emitted to flask.")
+        pass
 
 # Global for latest scan result
 scan_result = {'freq':[], 'power':[], 'peak_freq':[], 'peak_lvl':[], 'timestamp':'No data yet.', 'threshold':0}
@@ -84,16 +91,29 @@ def run_rtl_power(start, stop, step, filename="log_power.csv", dwell = 20, sdr_p
         filename)
 
     logging.info("Scanner #%s - Running frequency scan." % str(device_idx))
-    #logging.debug("Scanner - Running command: %s" % rtl_power_cmd)
+    logging.debug("Scanner #%s - Running command: %s" % (str(device_idx), rtl_power_cmd))
 
     try:
-        FNULL = open(os.devnull, 'w')
-        subprocess.check_call(rtl_power_cmd, shell=True, stderr=FNULL)
-        FNULL.close()
-    except subprocess.CalledProcessError:
-        logging.critical("Scanner #%s - rtl_power call failed!" % str(device_idx))
+        _output = subprocess.check_output(rtl_power_cmd, shell=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        # Something went wrong...
+        logging.critical("Scanner #%s - rtl_power call failed with return code %s." % (str(device_idx), e.returncode))
+        # Look at the error output in a bit more details.
+        _output = e.output.decode('ascii')
+        if 'No supported devices found' in _output:
+            logging.critical("Scanner #%s - rtl_power could not find device with ID %s, is your configuration correct?" % (str(device_idx), str(device_idx)))
+        elif 'illegal option' in _output:
+            if bias:
+                logging.critical("Scanner #%s - rtl_power reported an illegal option was used. Are you using a rtl_power version with bias tee support?" % str(device_idx))
+            else:
+                logging.critical("Scanner #%s - rtl_power reported an illegal option was used. (This shouldn't happen... are you running an ancient version?)" % str(device_idx))
+        else:
+            # Something else odd happened, dump the entire error output to the log for further analysis.
+            logging.critical("Scanner #%s - rtl_power reported error: %s" % (str(device_idx),_output))
+
         return False
     else:
+        # No errors reported!
         return True
 
 
@@ -156,7 +176,7 @@ def read_rtl_power(filename):
     return (freq, power, freq_step)
 
 
-def detect_sonde(frequency, rs_path="./", dwell_time=10, sdr_fm='rtl_fm', device_idx=0, ppm=0, gain=-1, bias=False):
+def detect_sonde(frequency, rs_path="./", dwell_time=10, sdr_fm='rtl_fm', device_idx=0, ppm=0, gain=-1, bias=False, save_detection_audio = False, ngp_tweak = False):
     """ Receive some FM and attempt to detect the presence of a radiosonde. 
 
     Args:
@@ -168,6 +188,8 @@ def detect_sonde(frequency, rs_path="./", dwell_time=10, sdr_fm='rtl_fm', device
         ppm (int): SDR Frequency accuracy correction, in ppm.
         gain (int): SDR Gain setting, in dB. A gain setting of -1 enables the RTLSDR AGC.
         bias (bool): If True, enable the bias tee on the SDR.
+        save_detection_audio (bool): Save the audio used in detection to a file.
+        ngp_tweak (bool): When scanning in the 1680 MHz sonde band, use a narrower FM filter for better RS92-NGP detection.
 
     Returns:
         str/None: Returns None if no sonde found, otherwise returns a sonde type, from the following:
@@ -176,6 +198,7 @@ def detect_sonde(frequency, rs_path="./", dwell_time=10, sdr_fm='rtl_fm', device
             'DFM' - Graw DFM06 / DFM09 (similar telemetry formats)
             'M10' - MeteoModem M10
             'iMet' - interMet iMet
+            'MK2LMS' - LMS6, 1680 MHz variant (using MK2A 9600 baud telemetry)
 
     """
 
@@ -191,54 +214,125 @@ def detect_sonde(frequency, rs_path="./", dwell_time=10, sdr_fm='rtl_fm', device
     else:
         gain_param = ''
 
-    rx_test_command = "timeout %ds %s %s-p %d -d %s %s-M fm -F9 -s 22k -f %d 2>/dev/null |" % (dwell_time, sdr_fm, bias_option, int(ppm), str(device_idx), gain_param, frequency) 
-    rx_test_command += "sox -t raw -r 22k -e s -b 16 -c 1 - -r 48000 -t wav - highpass 20 2>/dev/null |"
-    rx_test_command += os.path.join(rs_path,"rs_detect") + " -z -t 8 2>/dev/null >/dev/null"
+    # Adjust the detection bandwidth based on the band the scanning is occuring in.
+    if frequency < 1000e6:
+        # 400-406 MHz sondes - use a 22 kHz detection bandwidth.
+        _rx_bw = 22000
+    else:
+        # 1680 MHz sondes
+        # Both the RS92-NGP and 1680 MHz LMS6 have a much wider bandwidth than their 400 MHz counterparts.
+        # The RS92-NGP is maybe 25 kHz wide, and the LMS6 is 175 kHz (!!) wide.
+        # Given the huge difference between these two, we default to using a very wide FM bandwidth, but allow the user
+        # to narrow this if only RS92-NGPs are expected.
+        if ngp_tweak:
+            _rx_bw = 30000
+        else:
+            _rx_bw = 200000
 
+    # Sample Source (rtl_fm)
+    rx_test_command = "timeout %ds %s %s-p %d -d %s %s-M fm -F9 -s %d -f %d 2>/dev/null |" % (dwell_time*2, sdr_fm, bias_option, int(ppm), str(device_idx), gain_param, _rx_bw, frequency) 
+    # Sample filtering
+    rx_test_command += "sox -t raw -r %d -e s -b 16 -c 1 - -r 48000 -t wav - highpass 20 2>/dev/null | " % _rx_bw
+
+    # Saving of Debug audio, if enabled,
+    if save_detection_audio:
+        rx_test_command += "tee detect_%s.wav | " % str(device_idx)
+
+    # Sample decoding / detection
+    # Note that we detect for dwell_time seconds, and timeout after dwell_time*2, to catch if no samples are being passed through.
+    rx_test_command += os.path.join(rs_path,"dft_detect") + " -t %d 2>/dev/null" % dwell_time
+
+    logging.debug("Scanner #%s - Using detection command: %s" % (str(device_idx), rx_test_command))
     logging.debug("Scanner #%s - Attempting sonde detection on %.3f MHz" % (str(device_idx), frequency/1e6))
 
     try:
         FNULL = open(os.devnull, 'w')
-        ret_code = subprocess.call(rx_test_command, shell=True, stderr=FNULL)
+        _start = time.time()
+        ret_output = subprocess.check_output(rx_test_command, shell=True, stderr=FNULL)
         FNULL.close()
+        ret_output = ret_output.decode('utf8')
+    except subprocess.CalledProcessError as e:
+        # dft_detect returns a code of 1 if no sonde is detected.
+        # logging.debug("Scanner - dfm_detect return code: %s" % e.returncode)
+        if e.returncode == 124:
+            logging.error("Scanner #%s - dft_detect timed out." % str(device_idx))
+            raise IOError("Possible RTLSDR lockup.")
+
+        elif e.returncode >= 2:
+            ret_output = e.output.decode('utf8')
+        else:
+            _runtime = time.time() - _start
+            logging.debug("Scanner #%s - dft_detect exited in %.1f seconds with return code %d." % (str(device_idx), _runtime, e.returncode))
+            return None
     except Exception as e:
         # Something broke when running the detection function.
-        logging.error("Scanner #%s - Error when running rs_detect - %s" % (str(device_idx), str(e)))
+        logging.error("Scanner #%s - Error when running dft_detect - %s" % (str(device_idx), str(e)))
         return None
 
-    # Shift down by a byte... for some reason.
-    # NOTE: For some reason, we don't need to do this when using subprocess.call vs when using os.system.
-    # Should probably figure out why this is the case at some point.
-    #ret_code = ret_code >> 8
 
-    # Default is non-inverted FM.
-    inv = ""
+    _runtime = time.time() - _start
+    logging.debug("Scanner - dft_detect exited in %.1f seconds with return code 1." % _runtime)
 
-    # Check if the inverted bit is set
-    if (ret_code & 0x80) > 0: 
-        # If the inverted bit is set, we have to do some munging of the return code to get the sonde type.
-        ret_code = abs(-1 * (0x100 - ret_code))
+    # Check for no output from dft_detect.
+    if ret_output is None or ret_output == "":
+        #logging.error("Scanner - dft_detect returned no output?")
+        return None
 
-        inv = "-"
 
-    else:
-        ret_code = abs(ret_code)
 
-    if ret_code == 3:
-        logging.debug("Scanner #%s - Detected a RS41!" % str(device_idx))
-        return inv+"RS41"
-    elif ret_code == 4:
-        logging.debug("Scanner #%s - Detected a RS92!" % str(device_idx))
-        return inv+"RS92"
-    elif ret_code == 2:
-        logging.debug("Scanner #%s - Detected a DFM Sonde!" % str(device_idx))
-        return inv+"DFM"
-    elif ret_code == 5:
-        logging.debug("Scanner #%s - Detected a M10 Sonde!" % str(device_idx))
-        return inv+"M10"
-    elif ret_code == 6:
-        logging.debug("Scanner #%s - Detected a iMet Sonde! (Unsupported)" % str(device_idx))
-        return inv+"iMet"
+
+    # dft_detect return codes:
+    # 2 = DFM
+    # 3 = RS41
+    # 4 = RS92
+    # 5 = M10
+    # 6 = IMET (AB)
+    # 7 = IMET (RS)
+    # 8 = LMS6
+    # 9 = C34/C50
+    # 10 = MK2LMS (1680 MHz LMS6, which uses the MK2A telemetry format)
+
+    # Split the line into sonde type and correlation score.
+    _fields = ret_output.split(':')
+
+    if len(_fields) <2:
+        logging.error("Scanner - malformed output from dft_detect: %s" % ret_output.strip())
+        return None
+
+    _type = _fields[0]
+    _score = float(_fields[1].strip())
+
+
+    if 'RS41' in _type:
+        logging.debug("Scanner #%s - Detected a RS41! (Score: %.2f)" % (str(device_idx), _score))
+        return "RS41"
+    elif 'RS92' in _type:
+        logging.debug("Scanner #%s - Detected a RS92! (Score: %.2f)" % (str(device_idx), _score))
+        return "RS92"
+    elif 'DFM' in _type:
+        logging.debug("Scanner #%s - Detected a DFM Sonde! (Score: %.2f)" % (str(device_idx), _score))
+        return "DFM"
+    elif 'M10' in _type:
+        logging.debug("Scanner #%s - Detected a M10 Sonde! (Score: %.2f)" % (str(device_idx), _score))
+        return "M10"
+    elif 'IMET1RS' in _type:
+        logging.debug("Scanner #%s - Detected a iMet-4 Sonde! (Score: %.2f)" % (str(device_idx), _score))
+        return "iMet"     
+    elif 'IMET' in _type:
+        logging.debug("Scanner #%s - Detected a iMet Sonde! (Type %s - Unsupported) (Score: %.2f)" % (str(device_idx), _type, _score))
+        return _type
+    elif 'LMS6' in _type:
+        logging.debug("Scanner #%s - Detected a LMS6 Sonde! (Score: %.2f)" % (str(device_idx), _score))
+        return 'LMS6'
+    elif 'C34' in _type:
+        logging.debug("Scanner #%s - Detected a Meteolabor C34/C50 Sonde! (Unsupported) (Score: %.2f)" % (str(device_idx), _score))
+        return 'C34C50'
+    elif 'MK2LMS' in _type:
+        logging.debug("Scanner #%s - Detected a 1680 MHz LMS6 Sonde (MK2A Telemetry)! (Score: %.2f)" % (str(device_idx), _score))
+        if _score < 0:
+            return '-MK2LMS'
+        else:
+            return 'MK2LMS'
     else:
         return None
 
@@ -271,13 +365,18 @@ class SondeScanner(object):
         detect_dwell_time = 5,
         scan_delay = 10,
         max_peaks = 10,
+        scan_check_interval = 10,
         rs_path = "./",
         sdr_power = "rtl_power",
         sdr_fm = "rtl_fm",
         device_idx = 0,
         gain = -1,
         ppm = 0,
-        bias = False):
+        bias = False,
+        save_detection_audio = False,
+        temporary_block_list = {},
+        temporary_block_time = 60,
+        ngp_tweak = False):
         """ Initialise a Sonde Scanner Object.
 
         Apologies for the huge number of args...
@@ -300,6 +399,7 @@ class SondeScanner(object):
             detect_dwell_time (int): Number of seconds to allow rs_detect to attempt to detect a sonde. Default = 5 seconds.
             scan_delay (int): Delay X seconds between scan runs.
             max_peaks (int): Maximum number of peaks to search over. Peaks are ordered by signal power before being limited to this number.
+            scan_check_interval (int): If we are using a whitelist, re-check the RTLSDR works every X scan runs.
             rs_path (str): Path to the RS binaries (i.e rs_detect). Defaults to ./
             sdr_power (str): Path to rtl_power, or drop-in equivalent. Defaults to 'rtl_power'
             sdr_fm (str): Path to rtl_fm, or drop-in equivalent. Defaults to 'rtl_fm'
@@ -307,6 +407,10 @@ class SondeScanner(object):
             ppm (int): SDR Frequency accuracy correction, in ppm.
             gain (int): SDR Gain setting, in dB. A gain setting of -1 enables the RTLSDR AGC.
             bias (bool): If True, enable the bias tee on the SDR.
+            save_detection_audio (bool): Save the audio used in each detecton to detect_<device_idx>.wav
+            temporary_block_list (dict): A dictionary where each attribute represents a frequency that should be blacklisted for a set time.
+            temporary_block_time (int): How long (minutes) frequencies in the temporary block list should remain blocked for.
+            ngp_tweak (bool): Narrow the detection filter when searching for 1680 MHz sondes, to enhance detection of RS92-NGPs.
         """
 
         # Thread flag. This is set to True when a scan is running.
@@ -335,10 +439,24 @@ class SondeScanner(object):
         self.ppm = ppm
         self.bias = bias
         self.callback = callback
+        self.save_detection_audio = save_detection_audio
 
+        # Temporary block list.
+        self.temporary_block_list = temporary_block_list.copy()
+        self.temporary_block_list_lock = Lock()
+        self.temporary_block_time = temporary_block_time
+
+        # Alert the user if there are temporary blocks in place.
+        if len(self.temporary_block_list.keys())>0:
+            self.log_info("Temporary blocks in place for frequencies: %s" % str(self.temporary_block_list.keys()))
 
         # Error counter. 
         self.error_retries = 0
+
+        # Count how many scans we have performed.
+        self.scan_counter = 0
+        # If we run a whitelist, check the SDR every X scan loops.
+        self.scan_check_interval = scan_check_interval
 
         # This will become our scanner thread.
         self.sonde_scan_thread = None
@@ -350,7 +468,10 @@ class SondeScanner(object):
         if not _rtlsdr_ok:
             self.log_error("RTLSDR #%s non-functional - exiting." % device_idx)
             self.sonde_scanner_running = False
+            self.exit_state = "Failed SDR"
             return
+
+        self.exit_state = "OK"
 
         if auto_start:
             self.start()
@@ -373,7 +494,9 @@ class SondeScanner(object):
 
         """
         try:
-            if self.callback != None:
+            # Only send scan results to the callback if we are still running.
+            # This avoids sending scan results when the scanner is being shutdown.
+            if (self.callback != None) and self.sonde_scanner_running:
                 self.callback(results)
         except Exception as e:
             self.log_error("Error handling scan results - %s" % str(e))
@@ -390,12 +513,23 @@ class SondeScanner(object):
                 self.log_error("Exceeded maximum number of consecutive RTLSDR errors. Closing scan thread.")
                 break
 
+            # If we are using a whitelist, we don't have an easy way of checking the RTLSDR
+            # is producing useful data, so, test it.
+            if len(self.whitelist) > 0:
+                self.scan_counter += 1
+                if (self.scan_counter % self.scan_check_interval) == 0:
+                    self.log_debug("Performing periodic check of RTLSDR.")
+                    _rtlsdr_ok = rtlsdr_test(self.device_idx)
+                    if not _rtlsdr_ok:
+                        self.log_error("Unrecoverable RTLSDR error. Closing scan thread.")
+                        break
+
             try:
                 _results = self.sonde_search()
 
             except (IOError, ValueError) as e:
                 # No log file produced. Reset the RTLSDR and try again.
-                traceback.print_exc()
+                #traceback.print_exc()
                 self.log_warning("RTLSDR produced no output... resetting and retrying.")
                 self.error_retries += 1
                 # Attempt to reset the RTLSDR.
@@ -511,6 +645,7 @@ class SondeScanner(object):
             _, peak_idx = np.unique(peak_frequencies, return_index=True)
             peak_frequencies = peak_frequencies[np.sort(peak_idx)]
 
+
             # Remove any frequencies in the blacklist.
             for _frequency in np.array(self.blacklist)*1e6:
                 _index = np.argwhere(peak_frequencies==_frequency)
@@ -522,6 +657,25 @@ class SondeScanner(object):
 
             # Append on any frequencies in the supplied greylist
             peak_frequencies = np.append(np.array(self.greylist)*1e6, peak_frequencies)
+
+            
+            # Remove any frequencies in the temporary block list
+            self.temporary_block_list_lock.acquire()
+            for _frequency in self.temporary_block_list.keys():
+                # Check the time the block was added.
+                if self.temporary_block_list[_frequency] > (time.time()-self.temporary_block_time*60):
+                    # We should still be blocking this frequency, so remove any peaks with this frequency.
+                    _index = np.argwhere(peak_frequencies==_frequency)
+                    peak_frequencies = np.delete(peak_frequencies, _index)
+                    if len(_index) > 0:
+                        self.log_debug("Peak on %.3f MHz was removed due to temporary block." % (_frequency/1e6))
+
+                else:
+                    # This frequency doesn't need to be blocked any more, remove it from the block list.
+                    self.temporary_block_list.pop(_frequency)
+                    self.log_info("Removed %.3f MHz from temporary block list." % (_frequency/1e6))
+
+            self.temporary_block_list_lock.release()
 
             # Get the level of our peak search results, to send to the web client.
             # This is actually a bit of a pain to do...
@@ -562,24 +716,27 @@ class SondeScanner(object):
         # Run rs_detect on each peak frequency, to determine if there is a sonde there.
         for freq in peak_frequencies:
 
+            _freq = float(freq)
+
             # Exit opportunity.
             if self.sonde_scanner_running == False:
                 return []
 
-            detected = detect_sonde(freq,
+            detected = detect_sonde(_freq,
                 sdr_fm=self.sdr_fm,
                 device_idx=self.device_idx,
                 ppm=self.ppm,
                 gain=self.gain,
                 bias=self.bias,
-                dwell_time=self.detect_dwell_time)
+                dwell_time=self.detect_dwell_time,
+                save_detection_audio=self.save_detection_audio)
 
             if detected != None:
                 # Add a detected sonde to the output array
-                _search_results.append([freq, detected])
+                _search_results.append([_freq, detected])
 
                 # Immediately send this result to the callback.
-                self.send_to_callback([[freq, detected]])
+                self.send_to_callback([[_freq, detected]])
                 # If we only want the first detected sonde, then return now.
                 if first_only:
                     return _search_results
@@ -631,6 +788,20 @@ class SondeScanner(object):
     def running(self):
         """ Check if the scanner is running """
         return self.sonde_scanner_running
+
+
+    def add_temporary_block(self, frequency):
+        """ Add a frequency to the temporary block list.
+            
+        Args:
+            frequency (float): Frequency to be blocked, in Hz
+        """
+        # Acquire a lock on the block list, so we don't accidentally modify it
+        # while it is being used in a scan.
+        self.temporary_block_list_lock.acquire()
+        self.temporary_block_list[frequency] = time.time()
+        self.temporary_block_list_lock.release()
+        self.log_info("Adding temporary block for frequency %.3f MHz." % (frequency/1e6))
 
 
     def log_debug(self, line):

@@ -15,7 +15,7 @@ import traceback
 import json
 from base64 import b64encode
 from hashlib import sha256
-from threading import Thread
+from threading import Thread, Lock
 from . import __version__ as auto_rx_version
 try:
     # Python 2
@@ -84,6 +84,17 @@ def sonde_telemetry_to_sentence(telemetry, payload_callsign=None, comment=None):
 
     # Add in a comment field, containing the sonde type, serial number, and frequency.
     _sentence += ",%s %s %s" % (telemetry['type'], telemetry['id'], telemetry['freq'])
+
+    # Check for Burst/Kill timer data, and add in.
+    if 'bt' in telemetry:
+        if (telemetry['bt'] != -1) and (telemetry['bt'] != 65535):
+            _sentence += " BT %s" % time.strftime("%H:%M:%S", time.gmtime(telemetry['bt']))
+
+    # Add on the station code, which will only be present if we are receiving an iMet sonde.
+    # This may assist multiple receiving stations in the vicinity of an iMet launch site coordinate
+    # the iMet unique ID generation.
+    if 'station_code' in telemetry:
+        _sentence += " LOC: %s" % telemetry['station_code']
 
     # Add on any custom comment data if provided.
     if comment != None:
@@ -384,7 +395,7 @@ class HabitatUploader(object):
 
     def __init__(self, 
                 user_callsign = 'N0CALL', 
-                user_position = None,
+                station_position = (0.0,0.0,0.0),
                 user_antenna = "",
                 payload_callsign_override = None,
                 synchronous_upload_time = 30,
@@ -400,7 +411,7 @@ class HabitatUploader(object):
 
         Args:
             user_callsign (str): Callsign of the uploader.
-            user_position (tuple): Optional - a tuple consisting of (lat, lon, alt), which if populated,
+            station_position (tuple): Optional - a tuple consisting of (lat, lon, alt), which if populated,
                 is used to plot the listener's position on the Habitat map, both when this class is initialised, and
                 when a new sonde ID is observed.
 
@@ -427,7 +438,7 @@ class HabitatUploader(object):
         """
 
         self.user_callsign = user_callsign
-        self.user_position = user_position
+        self.station_position = station_position
         self.user_antenna = user_antenna
         self.payload_callsign_override = payload_callsign_override
         self.upload_timeout = upload_timeout
@@ -457,6 +468,9 @@ class HabitatUploader(object):
         # Record of when we last uploaded a user station position to Habitat.
         self.last_user_position_upload = 0
 
+        # Lock for dealing with telemetry uploads.
+        self.upload_lock = Lock()
+
         # Start the uploader thread.
         self.upload_thread_running = True
         self.upload_thread = Thread(target=self.habitat_upload_thread)
@@ -474,8 +488,12 @@ class HabitatUploader(object):
 
     def user_position_upload(self):
         """ Upload the the station position to Habitat. """
-        if self.user_position is not None:
-            _success = uploadListenerPosition(self.user_callsign, self.user_position[0], self.user_position[1], version=auto_rx_version, antenna=self.user_antenna)
+        if self.station_position == None:
+            self.last_user_position_upload = time.time()
+            return False
+
+        if (self.station_position[0] != 0.0) or (self.station_position[1] != 0.0):
+            _success = uploadListenerPosition(self.user_callsign, self.station_position[0], self.station_position[1], version=auto_rx_version, antenna=self.user_antenna)
             self.last_user_position_upload = time.time()
             return _success
         else:
@@ -580,6 +598,55 @@ class HabitatUploader(object):
         self.log_debug("Stopped Habitat Uploader Thread.")
 
 
+    def handle_telem_dict(self, telem, immediate=False):
+        # Try and convert it to a UKHAS sentence
+        try:
+            _sentence = sonde_telemetry_to_sentence(telem)
+        except Exception as e:
+            self.log_error("Error converting telemetry to sentence - %s" % str(e))
+            return
+
+        _callsign = "RS_" + telem['id']
+
+        # Wait for the upload_lock to be available, to ensure we don't end up with
+        # race conditions resulting in multiple payload docs being created.
+        self.upload_lock.acquire()
+
+        # Create a habitat document if one does not already exist:
+        if not self.observed_payloads[telem['id']]['habitat_document']:
+            # Check if there has already been telemetry from this ID observed on Habhub
+            _document_exists = check_callsign(_callsign)
+            # If so, we don't need to create a new document
+            if _document_exists:
+                self.observed_payloads[telem['id']]['habitat_document'] = True
+            else:
+                # Otherwise, we attempt to create a new document.
+                if self.inhibit:
+                    # If we have an upload inhibit, don't create a payload doc.
+                    _created = True
+                else:
+                    _created = initPayloadDoc(_callsign, description="Meteorology Radiosonde", frequency=telem['freq_float'])
+                
+                if _created:
+                    self.observed_payloads[telem['id']]['habitat_document'] = True
+                else:
+                    self.log_error("Error creating payload document!")
+                    self.upload_lock.release()
+                    return
+
+        if immediate:
+            self.log_info("Performing immediate upload for first telemetry sentence of %s." % telem['id'])
+            self.habitat_upload(_sentence)
+
+        else:
+            # Attept to add it to the habitat uploader queue.
+            try:
+                self.habitat_upload_queue.put_nowait(_sentence)
+            except Exception as e:
+                self.log_error("Error adding sentence to queue: %s" % str(e))
+
+        self.upload_lock.release()
+
 
     def upload_timer(self):
         """ Add packets to the habitat upload queue if it is time for us to upload. """
@@ -596,40 +663,8 @@ class HabitatUploader(object):
                         while not self.observed_payloads[_id]['data'].empty():
                             _telem = self.observed_payloads[_id]['data'].get()
 
-                        # Try and convert it to a UKHAS sentence
-                        try:
-                            _sentence = sonde_telemetry_to_sentence(_telem)
-                        except Exception as e:
-                            self.log_error("Error converting telemetry to sentence - %s" % str(e))
-                            continue
 
-                        _callsign = "RS_" + _id
-
-                        # Create a habitat document if one does not already exist:
-                        if not self.observed_payloads[_id]['habitat_document']:
-                            # Check if there has already been telemetry from this ID observed on Habhub
-                            _document_exists = check_callsign(_callsign)
-                            # If so, we don't need to create a new document
-                            if _document_exists:
-                                self.observed_payloads[_id]['habitat_document'] = True
-                            else:
-                                # Otherwise, we attempt to create a new document.
-                                if self.inhibit:
-                                    # If we have an upload inhibit, don't create a payload doc.
-                                    _created = True
-                                else:
-                                    _created = initPayloadDoc(_callsign, description="Meteorology Radiosonde", frequency=_telem['freq_float'])
-                                if _created:
-                                    self.observed_payloads[_id]['habitat_document'] = True
-                                else:
-                                    self.log_error("Error creating payload document!")
-                                    continue
-
-                        # Attept to add it to the habitat uploader queue.
-                        try:
-                            self.habitat_upload_queue.put_nowait(_sentence)
-                        except Exception as e:
-                            self.log_error("Error adding sentence to queue: %s" % str(e))
+                        self.handle_telem_dict(_telem)
 
                 # Sleep a second so we don't hit the synchronous upload time again.
                 time.sleep(1)
@@ -666,12 +701,17 @@ class HabitatUploader(object):
 
                     # If we have seen this particular ID enough times, add the data to the ID's queue.
                     if self.observed_payloads[_id]['count'] >= self.callsign_validity_threshold:
-                        # Add the telemetry to the queue
-                        self.observed_payloads[_id]['data'].put(_telem)
 
                         # If this is the first time we have observed this payload, update the listener position.
-                        if (self.observed_payloads[_id]['listener_updated'] == False) and (self.user_position is not None):
+                        if (self.observed_payloads[_id]['listener_updated'] == False) and (self.station_position is not None):
                             self.observed_payloads[_id]['listener_updated'] = self.user_position_upload()
+                            # Because receiving balloon telemetry appears to be a competition, immediately upload the
+                            # first valid position received.
+                            self.handle_telem_dict(_telem, immediate=True)
+                        else:
+                            # Otherwise, add the telemetry to the upload queue
+                            self.observed_payloads[_id]['data'].put(_telem)
+
 
                     else:
                         self.log_debug("Payload ID %s not observed enough to allow upload." % _id)
@@ -692,6 +732,10 @@ class HabitatUploader(object):
 
         """
 
+        # Discard any telemetry which is indicated to be encrypted.
+        if 'encrypted' in telemetry:
+            return
+
         # Check the telemetry dictionary contains the required fields.
         for _field in self.REQUIRED_FIELDS:
             if _field not in telemetry:
@@ -704,6 +748,10 @@ class HabitatUploader(object):
         else:
             self.log_error("Processing not running, discarding.")
 
+
+    def update_station_position(self, lat, lon, alt):
+        """ Update the internal station position record. Used when determining the station position by GPSD """
+        self.station_position = (lat, lon, alt)
 
 
     def close(self):

@@ -14,5 +14,5 @@ script:
   - pwd
   - cd auto_rx
   - ./build.sh
-  - export PATH=$PWD/tests/test_cmd/:$PATH
-  - python auto_rx.py -c ./tests/test_configs/test1.cfg -t 1
+  - export PATH=$PWD/../tests/test_cmd/:$PATH
+  - python auto_rx.py -c ../tests/test_configs/test1.cfg -t 1
